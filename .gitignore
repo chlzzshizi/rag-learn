@@ -9,11 +9,17 @@ __pycache__/
 *.egg-info/
 
 # ---------- 索引产物（可重建，不入库）----------
-# 这些是跑 embedding 生成的，重建要花时间，但体积大且是二进制的
-data/*.npy
-data/*.jsonl
-data/*.faiss
-data/manifest.json
+# 整个 data/ 全忽略，只留 .gitkeep 占位。
+#
+# 原来这里是一条条列扩展名的（data/*.npy、data/*.jsonl、data/*.faiss…），
+# 2026-09-19 换成 LangChain 之后就漏了：FAISS 把索引存成 data/lc_index/ 这个
+# **目录**，里面的 index.pkl 装的是 pickle 过的 Document —— 也就是语料正文。
+# 通配符 data/*.faiss 匹配不到嵌套路径，那两个文件差一点就被提交上去。
+#
+# 教训：用"允许列表"（只放行 .gitkeep）而不是"拒绝列表"（逐个列要挡的）。
+# 拒绝列表每加一种新产物就要补一条，迟早漏；漏的那次没人会注意到。
+data/*
+!data/.gitkeep
 
 # ---------- 模型缓存 ----------
 # 默认下载到 ~/.cache/huggingface，万一改到项目内要忽略掉
