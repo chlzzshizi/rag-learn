@@ -2,36 +2,59 @@
 # -*- coding: utf-8 -*-
 """切口体检：不靠肉眼，把每个切口"落在什么位置"分类统计出来。
 
-第 1 步肉眼翻切口是应该做的，但肉眼只能看出"读不通"，
-看不出"这个切口落在代码块内部"——后者要跨行才能判断，人翻 148 行必漏。
+原来这里 `from step1_chunk import ...`，2026-09-19 手写版被删掉后就跑不起来了。
+现在自包含，并且能查两种切法：
 
-这个脚本做三件事：
-  1. 证明全切了（偏移连续、无缝隙、无重叠、总长相等）
-  2. 清点语料里"能被切坏的结构"有多少（代码块、表格）
-  3. 给每个切口分类：落在行首 / 句中 / 代码块内 / 表格行内
+    fixed      固定长度切（手写版的做法），每 500 字符一刀，不看内容
+    recursive  LangChain 的 RecursiveCharacterTextSplitter，从大到小找边界
+
+同样参数下对比这两个，就是"用 LangChain 到底值不值"的硬证据。
 
 用法：
-    .venv/Scripts/python.exe scripts/inspect_cuts.py
+
+    .venv/Scripts/python.exe scripts/inspect_cuts.py                # 两种都查
+    .venv/Scripts/python.exe scripts/inspect_cuts.py --splitter fixed
+    .venv/Scripts/python.exe scripts/inspect_cuts.py --detail       # 列出切坏的
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from step1_chunk import CORPUS, CHUNK_SIZE, chunk_text, load_text  # noqa: E402
+ROOT = Path(__file__).resolve().parent.parent
+CORPUS = Path(r"C:\Users\33705\Desktop\项目\2026-07-04-yunxi-redesign.md")
+DEFAULT_SIZE = 500
+
+
+def load_text(path: Path) -> str:
+    if not path.exists():
+        sys.exit(f"找不到语料：{path}")
+    return path.read_text(encoding="utf-8")
+
+
+def split_fixed(text: str, size: int) -> list[str]:
+    """手写版的做法：range(0, len, size) 硬切，不看内容。"""
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+def split_recursive(text: str, size: int) -> list[str]:
+    """LangChain 的做法：按 separators 从大到小找落脚点，找不到才硬切。"""
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=size,
+        chunk_overlap=0,
+        length_function=len,
+        separators=["\n\n", "\n", "。", "；", "，", " ", ""],
+    )
+    return splitter.split_text(text)
 
 
 def find_fenced_ranges(text: str) -> list[tuple[int, int]]:
-    """返回所有围栏代码块（``` 包起来的部分）的字符区间。
-
-    做法：逐行扫，遇到以 ``` 开头的行就翻转状态。奇数个开围栏意味着
-    在块内。markdown 里嵌套围栏很少见，这个近似足够用。
-    """
-    ranges = []
-    pos = 0
-    open_at = None
+    """所有围栏代码块（``` 包起来的）的字符区间。"""
+    ranges, pos, open_at = [], 0, None
     for line in text.splitlines(keepends=True):
         if line.lstrip().startswith("```"):
             if open_at is None:
@@ -40,22 +63,20 @@ def find_fenced_ranges(text: str) -> list[tuple[int, int]]:
                 ranges.append((open_at, pos + len(line)))
                 open_at = None
         pos += len(line)
-    if open_at is not None:            # 围栏没闭合，一路到文件尾
+    if open_at is not None:
         ranges.append((open_at, len(text)))
     return ranges
 
 
 def find_table_ranges(text: str) -> list[tuple[int, int]]:
-    """返回所有 markdown 表格的字符区间（连续的以 | 开头的行算一张表）。"""
-    ranges = []
-    pos = 0
-    start = None
+    """所有 markdown 表格（连续以 | 开头的行）的字符区间。"""
+    ranges, pos, start = [], 0, None
     for line in text.splitlines(keepends=True):
         is_row = line.lstrip().startswith("|")
         if is_row and start is None:
             start = pos
         elif not is_row and start is not None:
-            if pos - start > 1:        # 单行不算表
+            if pos - start > 1:
                 ranges.append((start, pos))
             start = None
         pos += len(line)
@@ -65,94 +86,97 @@ def find_table_ranges(text: str) -> list[tuple[int, int]]:
 
 
 def in_ranges(offset: int, ranges: list[tuple[int, int]]) -> bool:
-    """offset 是不是落在某个区间**内部**（贴边不算）。"""
     return any(a < offset < b for a, b in ranges)
 
 
-def main() -> None:
-    text = load_text(CORPUS)
-    chunks = chunk_text(text, CHUNK_SIZE)
+def offsets_of(chunks: list[str]) -> list[int]:
+    """每块的起始偏移（第 0 块是 0，不算切口）。"""
+    out, pos = [], 0
+    for c in chunks:
+        out.append(pos)
+        pos += len(c)
+    return out
 
-    # ---------- 1. 全切了吗 ----------
-    print("=" * 66)
-    print("1. 覆盖检查 —— 全文都进块了吗")
-    print("=" * 66)
 
-    contiguous = all(chunks[i]["end"] == chunks[i + 1]["start"] for i in range(len(chunks) - 1))
-    total = sum(c["end"] - c["start"] for c in chunks)
-    checks = [
-        ("第一块从 0 开始", chunks[0]["start"] == 0),
-        ("最后一块到文件尾", chunks[-1]["end"] == len(text)),
-        ("块与块首尾相接，无缝隙", contiguous),
-        ("总长 == 文件字符数", total == len(text)),
-    ]
-    for name, ok in checks:
-        print(f"  {'✓' if ok else '✗'} {name}")
-    print(f"\n  0 → {chunks[-1]['end']:,} 连续覆盖 {len(text):,} 字符，"
-          f"切成 {len(chunks)} 块，一块不多一块不少。")
-    print("  **没有任何字符被跳过。** 不重叠的固定切块，这两件事是等价的。")
-
-    # ---------- 2. 语料里有什么可切的 ----------
-    print()
-    print("=" * 66)
-    print('2. 语料结构清点 —— 有什么东西是"会被切坏"的')
-    print("=" * 66)
-
+def analyze(label: str, text: str, chunks: list[str], detail: bool) -> dict:
     fences = find_fenced_ranges(text)
     tables = find_table_ranges(text)
+    starts = offsets_of(chunks)[1:]              # 跳过第 0 块
 
-    print(f"  围栏代码块  {len(fences):>4} 处，共 {sum(b - a for a, b in fences):>6,} 字符")
-    print(f"  markdown 表格 {len(tables):>4} 张，共 {sum(b - a for a, b in tables):>6,} 字符")
-
-    fence_lines = sum(1 for ln in text.splitlines() if ln.lstrip().startswith("```"))
-    table_lines = sum(1 for ln in text.splitlines() if ln.lstrip().startswith("|"))
-    lines = text.count("\n") + 1
-    print(f"\n  （交叉核对：以 ``` 开头的行 {fence_lines} 行；以 | 开头的行 {table_lines} 行；全文 {lines:,} 行）")
-    print(f"  合计占全文 {(sum(b - a for a, b in fences) + sum(b - a for a, b in tables)) / len(text) * 100:.1f}%")
-
-    # ---------- 3. 每个切口落在哪 ----------
-    print()
-    print("=" * 66)
-    print("3. 切口分类 —— 148 个切口各自落在什么位置")
-    print("=" * 66)
-
-    buckets = {"代码块内": [], "表格行内": [], "行首(切在换行处)": [], "句中(切在行中间)": []}
-    for c in chunks[1:]:                      # 第一个切口之前是块 0 的开头，跳过
-        p = c["start"]
+    buckets = {"代码块内": [], "表格行内": [], "行首": [], "句中": []}
+    for p in starts:
         if in_ranges(p, fences):
             buckets["代码块内"].append(p)
         elif in_ranges(p, tables):
             buckets["表格行内"].append(p)
-        elif text[p - 1] == "\n":
-            buckets["行首(切在换行处)"].append(p)
+        elif p > 0 and text[p - 1] == "\n":
+            buckets["行首"].append(p)
         else:
-            buckets["句中(切在行中间)"].append(p)
+            buckets["句中"].append(p)
 
-    n_cuts = len(chunks) - 1
-    for name, hits in buckets.items():
-        pct = len(hits) / n_cuts * 100
-        print(f"  {name:<18} {len(hits):>4} 个  ({pct:5.1f}%)")
-
+    n = len(starts)
+    lengths = [len(c) for c in chunks]
+    print(f"\n{'=' * 70}")
+    print(f"{label}")
+    print("=" * 70)
+    print(f"  {len(chunks)} 块，{n} 个切口；块长 {min(lengths)} ~ {max(lengths)}，"
+          f"平均 {sum(lengths) / len(lengths):.0f}")
     print()
-    print("  行首那几个是**运气**，不是设计 —— 500 是个整数，文档的行长不是，")
-    print("  所以切口落在哪儿完全取决于前面所有行的累计长度，纯巧合。")
+    for name in ("行首", "句中", "代码块内", "表格行内"):
+        hits = buckets[name]
+        print(f"    {name:<10} {len(hits):>4} 个  ({len(hits) / n * 100:5.1f}%)")
 
-    # ---------- 4. 最硬的那几个 ----------
-    print()
-    print("=" * 66)
-    print("4. 最硬的切口（切口落在代码块/表格内部）")
-    print("=" * 66)
+    bad = len(buckets["代码块内"]) + len(buckets["表格行内"])
+    print(f"\n  → 切在代码块/表格内部（硬伤）：{bad} 个，占 {bad / n * 100:.1f}%")
+    print(f"  → 落在换行处（干净）：{len(buckets['行首'])} 个，"
+          f"占 {len(buckets['行首']) / n * 100:.1f}%")
 
-    hard = [c for c in chunks[1:] if in_ranges(c["start"], fences) or in_ranges(c["start"], tables)]
-    if not hard:
-        print("  一个都没有。")
-    else:
-        for c in hard:
-            p = c["start"]
-            kind = "代码块" if in_ranges(p, fences) else "表格"
-            print(f"\n  ── 切口 #{c['i']}  偏移 {p:,}  落在【{kind}】内部 ──")
-            print(f"     上一块结尾 ...{text[p - 46:p]!r}")
-            print(f"     下一块开头 {text[p:p + 46]!r}...")
+    if detail:
+        for name in ("代码块内", "表格行内"):
+            for p in buckets[name]:
+                kind = "代码块" if in_ranges(p, fences) else "表格"
+                print(f"\n    偏移 {p:,} 落在【{kind}】内部")
+                print(f"      上一块结尾 …{text[max(0, p - 40):p]!r}")
+                print(f"      下一块开头 {text[p:p + 40]!r}…")
+
+    return {"chunks": len(chunks), "cuts": n, **{k: len(v) for k, v in buckets.items()}}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="切口体检")
+    ap.add_argument("--splitter", choices=["fixed", "recursive", "both"], default="both")
+    ap.add_argument("--size", type=int, default=DEFAULT_SIZE)
+    ap.add_argument("--detail", action="store_true", help="列出切在代码块/表格内部的切口")
+    args = ap.parse_args()
+
+    text = load_text(CORPUS)
+    fences = find_fenced_ranges(text)
+    tables = find_table_ranges(text)
+    print(f"语料 {CORPUS.name}：{len(text):,} 字符")
+    print(f"  {len(fences)} 个围栏代码块（{sum(b - a for a, b in fences):,} 字符）"
+          f" + {len(tables)} 张表格（{sum(b - a for a, b in tables):,} 字符）"
+          f" = 占全文 {(sum(b - a for a, b in fences) + sum(b - a for a, b in tables)) / len(text) * 100:.1f}%")
+
+    results = {}
+    if args.splitter in ("fixed", "both"):
+        results["fixed"] = analyze(f"固定长度切块（手写版做法）  size={args.size}",
+                                   text, split_fixed(text, args.size), args.detail)
+    if args.splitter in ("recursive", "both"):
+        results["recursive"] = analyze(f"RecursiveCharacterTextSplitter（LangChain）  size={args.size}",
+                                       text, split_recursive(text, args.size), args.detail)
+
+    if len(results) == 2:
+        f, r = results["fixed"], results["recursive"]
+        print(f"\n{'=' * 70}")
+        print("对比")
+        print("=" * 70)
+        print(f"  块数        {f['chunks']:>4}  →  {r['chunks']:>4}   "
+              f"({r['chunks'] - f['chunks']:+d})")
+        for k in ("行首", "句中", "代码块内", "表格行内"):
+            print(f"  {k:<10} {f[k]:>4}  →  {r[k]:>4}   ({r[k] - f[k]:+d})")
+        fb = f["代码块内"] + f["表格行内"]
+        rb = r["代码块内"] + r["表格行内"]
+        print(f"\n  硬伤占比    {fb / f['cuts'] * 100:>5.1f}%  →  {rb / r['cuts'] * 100:>5.1f}%")
 
 
 if __name__ == "__main__":
