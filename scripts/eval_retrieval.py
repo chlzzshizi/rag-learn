@@ -28,11 +28,25 @@
     锚点跨块     → 语料里有，但没有一块完整包含 → **切块把它劈开了**
     锚点不唯一   → 落在多块 → 正常，但要如实报出来
 
+## 三路检索（2026-09-20 加的）
+
+    dense   现在的稠密检索（FAISS + Qwen3-Embedding-0.6B）
+    bm25    BM25 词面检索，纯 Python，不花钱
+    hybrid  两路 RRF 融合（见 src/hybrid.py）
+
+**加 BM25 的理由**：第 5 步诊断出「0.6B 稠密检索基本是词面级匹配」——
+它在用不擅长的方式做它该做的事。而词面匹配有专门做到极致的算法。
+
+**为什么这里可以放心测**：本脚本判的是「召回的块里有没有那句话」，而块是语料
+**逐字**切出来的 —— 不存在答案级评测那个「改写就不认账」的问题。
+**第 5 步的数字可信、第 6 步的不敢信，差别就在这。**
+
 用法：
 
     .venv/Scripts/python.exe scripts/eval_retrieval.py
     .venv/Scripts/python.exe scripts/eval_retrieval.py -k 4 --verbose
     .venv/Scripts/python.exe scripts/eval_retrieval.py --sweep
+    .venv/Scripts/python.exe scripts/eval_retrieval.py --retriever dense  # 只看稠密
 """
 
 from __future__ import annotations
@@ -134,11 +148,10 @@ def audit(corpus: str, chunks: dict[int, str]) -> list[tuple]:
     return problems
 
 
-def evaluate(store, chunks: dict[int, str], k: int) -> list[dict]:
+def evaluate(retrieve, chunks: dict[int, str], k: int) -> list[dict]:
     out = []
     for case in all_cases():
-        got = {d.metadata["i"] for d, _s in store.similarity_search_with_score(case["q"], k=k)}
-        got &= set(chunks)
+        got = set(retrieve(case["q"], k)) & set(chunks)
 
         gstat = []
         for group in case["groups"]:
@@ -155,25 +168,36 @@ def evaluate(store, chunks: dict[int, str], k: int) -> list[dict]:
     return out
 
 
-def report(results: list[dict], k: int, chunks: dict, verbose: bool) -> None:
+def report(by_retriever: dict[str, list[dict]], k: int, chunks: dict,
+           verbose: bool) -> None:
     print("\n" + "=" * 76)
-    print(f"检索评测  k={k}")
+    print(f"检索评测  k={k}   路数：{' / '.join(by_retriever)}")
     print("=" * 76)
 
-    for r in results:
-        c = r["case"]
-        mark = "✅" if r["ok"] else ("🟡" if any(h for h, _ in r["gstat"]) else "❌")
-        short = "／".join(f"{h}/{n}" for h, n in r["gstat"])
-        print(f"\n{mark} [{c['type']}] {c['q']}")
-        print(f"   答案最少要 {r['need']} 块"
-              + ("" if r["need"] > k else f"，k={k} 够装")
-              + (f"  ⚠ **k={k} 装不下，结构上做不到**" if r["need"] > k else ""))
-        print(f"   各组锚点命中：{short}   （{c['mode']} 语义）")
-        print(f"   召回：{r['got']}")
-        if verbose:
-            for i in r["got"]:
-                tag = "★答案区" if i in r["span"] else "  噪音"
-                print(f"      {tag}  第 {i:>3} 块  {chunks[i][:48]}".replace("\n", "⏎"))
+    names = list(by_retriever)
+    w = max(len(n) for n in names)
+    cases = all_cases()
+
+    for qi, c in enumerate(cases):
+        # 每路一个记号：✓ 全中 / ◐ 半中 / ✗ 全丢。顺序 = 上面的「路数」
+        marks = "".join(
+            "✓" if by_retriever[n][qi]["ok"]
+            else ("◐" if any(h for h, _ in by_retriever[n][qi]["gstat"]) else "✗")
+            for n in names)
+        r0 = by_retriever[names[0]][qi]
+        print(f"\n{marks} [{c['题库']}/{c['type']}] {c['q']}")
+        print(f"   答案最少要 {r0['need']} 块"
+              + ("" if r0["need"] > k else f"，k={k} 够装")
+              + (f"  ⚠ **k={k} 装不下，结构上做不到**" if r0["need"] > k else ""))
+        for n in names:
+            r = by_retriever[n][qi]
+            short = "／".join(f"{h}/{tot}" for h, tot in r["gstat"])
+            print(f"   {n:<{w}}  {'✓' if r['ok'] else '✗'}  {short:<16}"
+                  f"（{c['mode']} 语义）  召回 {r['got']}")
+            if verbose:
+                for i in r["got"]:
+                    tag = "★答案区" if i in r["span"] else "  噪音"
+                    print(f"      {tag}  第 {i:>3} 块  {chunks[i][:48]}".replace("\n", "⏎"))
 
     # ---- 汇总：**分题库报，不给跨库合计** ----
     #
@@ -184,20 +208,44 @@ def report(results: list[dict], k: int, chunks: dict, verbose: bool) -> None:
     print("\n" + "=" * 76)
     print(f"汇总（k={k}）")
     print("=" * 76)
-    print(f"{'题库':<8}{'类型':<6}{'题数':>5}{'答得出':>8}{'命中率':>9}{'答案最少需块':>14}")
+    print(f"{'题库':<8}{'类型':<6}{'题数':>5}"
+          + "".join(f"{n:>9}" for n in names) + f"{'答案最少需块':>14}")
     for 题库 in ("设计文档", "bug文档"):
         for t in ("集中", "散落"):
-            rs = [r for r in results
-                  if r["case"]["题库"] == 题库 and r["case"]["type"] == t]
-            if not rs:
+            idx = [i for i, c in enumerate(cases)
+                   if c["题库"] == 题库 and c["type"] == t]
+            if not idx:
                 continue
-            n_ok = sum(1 for r in rs if r["ok"])
-            avg_need = sum(r["need"] for r in rs) / len(rs)
-            print(f"{题库:<8}{t:<6}{len(rs):>5}{n_ok:>8}"
-                  f"{n_ok / len(rs) * 100:>8.0f}%{avg_need:>13.1f}")
+            row = f"{题库:<8}{t:<6}{len(idx):>5}"
+            for n in names:
+                n_ok = sum(1 for i in idx if by_retriever[n][i]["ok"])
+                row += f"{n_ok / len(idx) * 100:>8.0f}%"
+            avg_need = sum(cases[i].get("_need", 0) for i in idx) / len(idx)
+            print(row + f"{avg_need:>14.1f}")
 
-    print("\n  归因 —— 没答得出的题，卡在哪：")
-    for r in results:
+    # 逐题差异 —— 三路一致就不列，只看**有分歧的**。
+    # 这是三路对照真正要看的东西：均值会把「哪题赢的、谁赢的」抹平。
+    if len(names) > 1:
+        print(f"\n  逐题差异（顺序 {' / '.join(names)}；全一致的不列）：")
+        n_diff = 0
+        for qi, c in enumerate(cases):
+            oks = [by_retriever[n][qi]["ok"] for n in names]
+            if all(oks) or not any(oks):
+                continue
+            n_diff += 1
+            marks = "".join("✓" if o else "·" for o in oks)
+            win = "、".join(n for n, o in zip(names, oks) if o)
+            print(f"     {marks}  [{c['题库']}/{c['type']}] {c['q'][:34]}…")
+            print(f"            找到的：{win}")
+        if not n_diff:
+            print("     （没有 —— 三路逐题结果完全一致）")
+
+    # 归因报**最后一路**（--retriever all 时就是 hybrid）：它是当前的结论路，
+    # 前面几路的历史差异已经由上面的逐题差异块说完了。
+    main_name = names[-1]
+    print(f"\n  归因 —— {main_name} 没答得出的题，卡在哪：")
+    for qi, c in enumerate(cases):
+        r = by_retriever[main_name][qi]
         if r["ok"]:
             continue
         if r["need"] > k:
@@ -206,7 +254,7 @@ def report(results: list[dict], k: int, chunks: dict, verbose: bool) -> None:
             why = f"只拿到部分答案（{r['gstat']}），**排序没把剩下的排进前 {k}**"
         else:
             why = f"一片答案都没召到，**排序完全没排上**"
-        print(f"     [{r['case']['type']}] {r['case']['q'][:26]}…  ← {why}")
+        print(f"     [{c['type']}] {c['q'][:26]}…  ← {why}")
 
 
 def main() -> None:
@@ -216,6 +264,15 @@ def main() -> None:
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--instruct", action="store_true",
                     help="查询端加 Qwen3-Embedding 的 instruction 前缀（文档端不加）")
+    ap.add_argument("--retriever", default="all",
+                    choices=["dense", "bm25", "hybrid", "all"],
+                    help="跑哪几路。all（默认）= 三路逐题对照")
+    ap.add_argument("--depth", type=int, default=None,
+                    help="融合时每路各取多少候选（默认 max(4k, 20)）")
+    ap.add_argument("--rrf-k", type=int, default=5,
+                    help="RRF 常数。**默认 5 不是教科书的 60** —— 60 是给上千深"
+                         "候选列表定的，这里会把名次压平、让噪音共识胜出。"
+                         "扫描见 scripts/eval_fuse_sweep.py")
     args = ap.parse_args()
 
     import rag
@@ -239,8 +296,26 @@ def main() -> None:
 
     problems = audit(corpus, chunks)
 
+    names = ["dense", "bm25", "hybrid"] if args.retriever == "all" else [args.retriever]
+
+    hyb = None
+    if any(n in ("bm25", "hybrid") for n in names):
+        print("\n建 BM25 索引（jieba 分词 + IDF，几秒）…", flush=True)
+        import hybrid
+        hyb = hybrid.HybridRetriever(store, chunks, depth=args.depth,
+                                     rrf_k=args.rrf_k)
+
+    def dense(q, k):
+        return [d.metadata["i"] for d, _s in store.similarity_search_with_score(q, k=k)]
+
+    RETRIEVERS = {"dense": dense,
+                  "bm25": hyb.bm25.search if hyb else None,
+                  "hybrid": hyb.search if hyb else None}
+    retrievers = {n: RETRIEVERS[n] for n in names}
+
     for k in sorted({args.k} | ({1, 2, 8, 16} if args.sweep else set())):
-        report(evaluate(store, chunks, k), k, chunks, args.verbose)
+        by = {n: evaluate(f, chunks, k) for n, f in retrievers.items()}
+        report(by, k, chunks, args.verbose)
 
     sys.exit(1 if problems else 0)
 
