@@ -83,26 +83,22 @@ CASES = [
 
     dict(type="散落", mode="all",
          q="顾客有哪两种来源？系统怎么区分「设过密码」和「没设过密码」？",
-         groups=[["hasPassword()：门店单顾客从没设过密码"],               # §三 域
-                 ["**NULL**（线上确实不知道他是谁）"],                     # §4.3 表
+         groups=[["**NULL**（线上确实不知道他是谁）"],                     # §4.3 表
                  ["注册即登录，**只要手机号+密码**"]]),                     # §11.6
 
     dict(type="散落", mode="all",
          q="一个 token 会因为哪些原因失效？",
-         groups=[["登出时 Token 加入 Redis 黑名单"],                      # §6.2
-                 ["auth:staff:invalidAfter:<staffId> = 当前毫秒"],         # §6.2
-                 ["canLogin()：只有明确 status=1 才放行"]]),               # §三 域
+         groups=[["登出时 Token 加入 Redis 黑名单"],                      # §6.2 按票
+                 ["auth:staff:invalidAfter:<staffId> = 当前毫秒"]]),       # §6.2 按人
 
     dict(type="散落", mode="all",
          q="项目里 Redis 存了哪些东西？各自的键名是什么？",
          groups=[["coupon:stock:{couponId}", "coupon:grabbed:{couponId}"],        # §11.5
-                 ["blacklist:token:", "auth:staff:invalidAfter:<staffId> = 当前毫秒"],  # §6.2
-                 ["Redis 库存只是 MySQL 的**加速副本**"]]),                # §11.10
+                 ["blacklist:token:", "auth:staff:invalidAfter:<staffId> = 当前毫秒"]]),  # §6.2
 
     dict(type="散落", mode="all",
          q="「管理员不参与业务」具体体现在哪几件事上？",
          groups=[["不参与订单操作，也不能改价"],                            # §4.2
-                 ["管理员 403 只剩三处"],                                  # §4.2
                  ["管理员 → 403「管理员不参与发券」"]]),                     # §11.6
 ]
 
