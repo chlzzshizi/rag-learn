@@ -95,6 +95,7 @@ import re
 import sys
 import time
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -290,12 +291,48 @@ def copy_ratio(answer: str, corpus_grams: set[str]) -> float:
 
 
 # ── 两臂 ────────────────────────────────────────────────────────────────
+#
+# RAG 臂有**三路检索**可选。为什么不是一条：第 6 步那句「检索是负收益」的 RAG 臂
+# 用的是**旧的稠密检索**，之后第 7 步上了 BM25 混合、第 8 步换了切块 ——
+# **那一臂被换过两次，两臂早就不再可比**。一次跑三路才能同时回答两个问题：
+# 「旧结论复现吗」和「换成最好的检索还成立吗」。
+#
+# 长上下文臂只跑一次（它最贵，每次 10 万 token 输入），
+# 所以三路 RAG 共用一个对照，不必付三遍。
 
-def run_rag(question: str, store, corpus: str, k: int, llm):
+_RAG_CACHE: dict[str, object] = {}
+
+
+def _docs_by_id(store) -> dict[int, object]:
+    if "by_id" not in _RAG_CACHE:
+        _RAG_CACHE["by_id"] = {
+            d.metadata["i"]: d
+            for d in (store.docstore.search(i)
+                      for i in store.index_to_docstore_id.values())}
+    return _RAG_CACHE["by_id"]
+
+
+def _rag_hits(question: str, store, k: int, retriever: str):
+    """取回的 Document 列表。**这里是唯一决定用哪路检索的地方。**"""
+    if retriever == "dense":
+        return store.similarity_search(question, k=k)
+    import hybrid
+    if "hybrid" not in _RAG_CACHE:
+        chunks = {i: d.page_content for i, d in _docs_by_id(store).items()}
+        # depth / rrf_k 用默认值，跟 eval_retrieval.py 保持一致 ——
+        # 否则这里量的就不是那边评测过的那一路了
+        _RAG_CACHE["hybrid"] = hybrid.HybridRetriever(store, chunks)
+    h = _RAG_CACHE["hybrid"]
+    ids = h.bm25.search(question, k=k) if retriever == "bm25" else h.search(question, k=k)
+    by_id = _docs_by_id(store)
+    return [by_id[i] for i in ids if i in by_id]
+
+
+def run_rag(question: str, store, corpus: str, k: int, llm, retriever: str = "dense"):
     import rag
     import longctx
 
-    hits = store.similarity_search(question, k=k)
+    hits = _rag_hits(question, store, k, retriever)
     material = rag.format_docs(hits)
     msg = llm.invoke(longctx.build_messages(material, question))
     return (msg.content, longctx.usage_of(msg),
@@ -310,7 +347,10 @@ def run_long(question: str, store, corpus: str, k: int, llm):
 
 
 ARMS = {
-    "rag": ("RAG（检索 top-k）", run_rag),
+    # `dense` 就是历史上的 `rag` 臂（旧 dump 里的 arm 名是 "rag"，两者同一个东西）
+    "dense": ("RAG·稠密 top-k", partial(run_rag, retriever="dense")),
+    "bm25": ("RAG·BM25 top-k", partial(run_rag, retriever="bm25")),
+    "hybrid": ("RAG·混合 top-k", partial(run_rag, retriever="hybrid")),
     "long": ("长上下文（整份语料）", run_long),
 }
 
@@ -434,7 +474,8 @@ def report(rows: list[dict], k: int, nulls: dict) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="第 6 步：答案级评测")
-    ap.add_argument("--arms", default="rag,long", help="跑哪些臂，逗号分隔")
+    ap.add_argument("--arms", default="dense,bm25,hybrid,long",
+                    help="跑哪些臂，逗号分隔（可选 " + "/".join(ARMS) + "）")
     ap.add_argument("-k", type=int, default=4, help="RAG 臂召回几块（默认 4）")
     ap.add_argument("--limit", type=int, help="只跑前 N 道（先小样试）")
     args = ap.parse_args()
@@ -535,7 +576,9 @@ def main() -> None:
     # 两臂的缓存行为根本不同（长上下文臂前缀固定，RAG 臂每问都变），
     # 混在一起报会把 RAG 臂正常的 0% 当成故障。
     print()
-    for arm in ("long", "rag"):
+    # 长上下文臂排最前（它是基准，也是唯一该有缓存的那一臂，先看到省事）。
+    # ⚠ 别写 `("long", *ARMS)` —— `ARMS` 里本来就有 `long`，那行会**打两遍**（踩过）。
+    for arm in [a for a in ["long", *(a for a in ARMS if a != "long")] if a in arms]:
         us = [r[arm]["usage"] for _q, r in rows if arm in r]
         if not us:
             continue
