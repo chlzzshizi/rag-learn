@@ -17,38 +17,46 @@
     .venv/Scripts/python.exe src/rag.py "订单状态有哪些状态"
     .venv/Scripts/python.exe src/rag.py "..." --k 3 --show    # 顺便打印召回的原文
     .venv/Scripts/python.exe src/rag.py "..." --rebuild       # 强制重建索引
+    .venv/Scripts/python.exe src/rag.py "..." --rebuild --chunker flat   # 用旧切法建
 
 索引存在 data/lc_index/，第二次跑会直接读，不用重新编码（建一次约 2 分钟）。
+
+**索引会把自己的来历写进 `data/lc_index/build.json`**（切法、块数、语料指纹）。
+加了 `--chunker` 之后这不是可选项：谁跑一次 `--chunker flat` 建索引，之后所有评测
+都会读到 flat 建的东西却以为看的是新的。三个评测脚本都会把这行自述打出来。
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from chunking import CHUNK_OVERLAP, CHUNK_SIZE, CHUNKER_DOC, CHUNKERS, pieces_of
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 INDEX_DIR = DATA / "lc_index"
+BUILD_INFO = INDEX_DIR / "build.json"
 # 语料是**多份**了（设计文档 + bug 记录）。顺序固定 —— 索引里的块号 i 依赖它，
 # 顺序一变块号全变，对着旧块号记的笔记就废了。
 #
-# 两份都是 markdown，所以下面那套中文分隔符对两边都成立，不需要按扩展名分派切块器。
+# 两份都是 markdown，所以切块那套对两边都成立，不需要按扩展名分派切块器。
 CORPUSES = [
     Path(r"C:\Users\33705\Desktop\项目\2026-07-04-yunxi-redesign.md"),
     Path(r"D:\study\yunxi-server\docs\bug-record.md"),
 ]
 MODEL_DIR = ROOT / "models" / "Qwen3-Embedding-0.6B"
 
-# 跟手写版一样的 500 / 0，好直接对比。
-# 注意：这个 splitter **不会**在固定位置切，它按 separators 从大到小找边界
-# （段落 → 换行 → 空格 → 字符）。所以同样是 500，切出来的块数会和手写版不同
-# —— 那个差异就是"语义切块 vs 固定切块"的全部内容。
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 0
+# 切块参数和切法都住在 chunking.py。这里再导一次**只是为了让老调用点不炸**
+# （eval_retrieval.py 里引了 rag.CHUNK_SIZE / rag.CHUNK_OVERLAP）。
+DEFAULT_CHUNKER = "md"
 
 QUESTIONS = [
     "订单状态有哪些状态",
@@ -96,38 +104,32 @@ def corpus_texts():
         yield src.name, f"# 文件：{src.name}\n\n" + src.read_text(encoding="utf-8")
 
 
-def build_index(embeddings, verbose=True):
-    """读文档 → 切块 → 编码 → 存 FAISS。"""
+def build_index(embeddings, chunker=DEFAULT_CHUNKER, verbose=True):
+    """读文档 → 切块 → 编码 → 存 FAISS。切法见 chunking.py。"""
     import torch  # noqa: F401  （确认 torch 在，报错更早更清楚）
     from langchain_community.vectorstores import FAISS
     from langchain_core.documents import Document
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        length_function=len,
-        # 中文没有空格，默认的 " " 分隔符基本用不上；显式加上中文标点，
-        # 让它在句子/分句的边界上找落脚点。
-        separators=["\n\n", "\n", "。", "；", "，", " ", ""],
-    )
 
     # 逐份切，块号 i **全局连续**（跨文件不重置）。理由是检索评测拿 i 当块的身份，
     # 重置的话两份语料会出现两个「第 3 块」，对不上号。
-    docs, total_chars = [], 0
+    docs, total_chars, corpus_meta = [], 0, []
     for name, text in corpus_texts():
         total_chars += len(text)
-        part = splitter.create_documents([text])
-        for d in part:
-            d.metadata["source"] = name
-        docs.extend(part)
+        corpus_meta.append({
+            "name": name, "chars": len(text),
+            # 语料一改块号全变，留个指纹好判断「这份索引是哪版语料建的」
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        })
+        for p in pieces_of(text, chunker):
+            docs.append(Document(page_content=p.render(True),
+                                 metadata={"source": name}))
 
     for i, d in enumerate(docs):
         d.metadata["i"] = i
 
     if verbose:
         print(f"切块  {total_chars:,} 字符（{len(CORPUSES)} 份）→ {len(docs)} 块"
-              f"（chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}）")
+              f"（切法={chunker}：{CHUNKER_DOC[chunker]}）")
         for src in CORPUSES:
             n = sum(1 for d in docs if d.metadata["source"] == src.name)
             print(f"      {src.name}：{n} 块")
@@ -136,8 +138,17 @@ def build_index(embeddings, verbose=True):
     store = FAISS.from_documents(docs, embeddings)
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
     store.save_local(str(INDEX_DIR))
+
+    # ---- 索引自述 ----
+    # **不写这个文件，早晚会把两步的数字搅在一起**：加了 --chunker 之后，
+    # 谁跑一次 --chunker flat，之后所有评测都会读到 flat 建的索引却以为看的是新的。
+    info = {"chunker": chunker, "chunk_size": CHUNK_SIZE, "overlap": CHUNK_OVERLAP,
+            "block_count": len(docs), "created_at": datetime.now().isoformat(timespec="seconds"),
+            "corpus": corpus_meta}
+    BUILD_INFO.write_text(json.dumps(info, ensure_ascii=False, indent=2),
+                          encoding="utf-8")
     if verbose:
-        print(f"      索引已存到 {INDEX_DIR.relative_to(ROOT)}/")
+        print(f"      索引已存到 {INDEX_DIR.relative_to(ROOT)}/（自述在 build.json）")
     return store, docs
 
 
@@ -146,8 +157,26 @@ def load_index(embeddings):
 
     # allow_dangerous_deserialization：FAISS 索引是 pickle，加载等于执行代码。
     # 这里加载的是**我们自己刚生成的**文件，所以可以开；从网上下来的索引绝不能开。
-    return FAISS.load_local(str(INDEX_DIR), embeddings,
-                            allow_dangerous_deserialization=True)
+    store = FAISS.load_local(str(INDEX_DIR), embeddings,
+                             allow_dangerous_deserialization=True)
+    # 把自述挂上去，让评测脚本能打出来「这份索引是用什么切法建的」
+    try:
+        store.chunker_meta = json.loads(BUILD_INFO.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        store.chunker_meta = None
+    return store
+
+
+def describe_index(meta) -> str:
+    """一行索引自述，三个评测脚本共用。**没有自述就大声说没有。**"""
+    if not meta:
+        return ("⚠ data/lc_index/build.json 不存在 —— 这是**老索引**或手工拷来的，"
+                "不知道它是用什么切法建的。重新建一次就有自述了。")
+    corp = " + ".join(f"{c['name']}({c['chars']:,}字)" for c in meta.get("corpus", []))
+    return (f"索引自述：切法={meta['chunker']}（{CHUNKER_DOC.get(meta['chunker'], '?')}）"
+            f"  size={meta['chunk_size']} overlap={meta['overlap']}"
+            f"  {meta['block_count']} 块  建于 {meta['created_at']}\n"
+            f"          语料：{corp}")
 
 
 def get_llm():
@@ -212,6 +241,9 @@ def main():
     ap.add_argument("-k", type=int, default=4, help="召回几块（默认 4）")
     ap.add_argument("--rebuild", action="store_true", help="强制重建索引")
     ap.add_argument("--show", action="store_true", help="打印召回的原文全文")
+    ap.add_argument("--chunker", default=DEFAULT_CHUNKER, choices=list(CHUNKERS),
+                    help="切法（只在 --rebuild 时生效）。"
+                         + "；".join(f"{k}={v}" for k, v in CHUNKER_DOC.items()))
     args = ap.parse_args()
 
     load_dotenv(ROOT / ".env")
@@ -222,10 +254,11 @@ def main():
     embeddings = get_embeddings()
 
     if args.rebuild or not INDEX_DIR.exists():
-        store, _ = build_index(embeddings)
+        store, _ = build_index(embeddings, chunker=args.chunker)
     else:
         print(f"读已有索引 {INDEX_DIR.relative_to(ROOT)}/（要重建加 --rebuild）")
         store = load_index(embeddings)
+        print(describe_index(getattr(store, "chunker_meta", None)))
 
     retriever = store.as_retriever(search_kwargs={"k": args.k})
     llm = get_llm()

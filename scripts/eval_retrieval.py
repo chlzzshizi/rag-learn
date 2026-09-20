@@ -287,6 +287,7 @@ def main() -> None:
         }
         print("查询端已加 instruction 前缀")
     store = rag.load_index(emb)
+    print(rag.describe_index(getattr(store, "chunker_meta", None)))
     chunks = chunks_from_store(store)
     parts = list(rag.corpus_texts())
     corpus = "\n\n".join(t for _n, t in parts)

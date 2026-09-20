@@ -25,9 +25,13 @@
 ## 两个必须遵守的约束
 
 **① 不用 `.format()`，也不用 ChatPromptTemplate 去渲染语料。**
-语料里有 66 处花括号（`{couponId}`、`{staffId}`、`{ ... }`），
-任何把语料当模板变量传的写法都会 `KeyError: 'couponId'`。
+语料里有 **147 处花括号**（设计文档 53 + bug 文档 94；`{couponId}`、`{staffId}`、
+`{ ... }`），任何把语料当模板变量传的写法都会 `KeyError: 'couponId'`。
 这里走 messages 列表 + 纯字符串拼接，**不经过任何模板引擎**。
+
+> 这个数**跟着语料走**，改动语料后重新数一遍再改这里：
+> `.venv/Scripts/python.exe -c "import sys;sys.path.insert(0,'src');import rag;
+> print(sum(t.count('{') for _n,t in rag.corpus_texts()))"`
 
 **② 固定的放前面，问题放最后。**
 DeepSeek 的上下文缓存要求「从第 0 个 token 起前缀逐字节相同」才算命中，

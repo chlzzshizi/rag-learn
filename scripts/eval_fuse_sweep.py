@@ -74,6 +74,7 @@ def main() -> None:
 
     emb = rag.get_embeddings()
     store = rag.load_index(emb)
+    print(rag.describe_index(getattr(store, "chunker_meta", None)))
     chunks = {}
     for _vi, did in store.index_to_docstore_id.items():
         d = store.docstore.search(did)

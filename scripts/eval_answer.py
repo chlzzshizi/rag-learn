@@ -458,6 +458,7 @@ def main() -> None:
 
     emb = rag.get_embeddings()
     store = rag.load_index(emb)
+    print(rag.describe_index(getattr(store, "chunker_meta", None)))
     llm = rag.get_llm()
 
     # ---- S1 语料完整性断言（阻塞级）----
