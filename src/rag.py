@@ -33,7 +33,14 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 INDEX_DIR = DATA / "lc_index"
-CORPUS = Path(r"C:\Users\33705\Desktop\项目\2026-07-04-yunxi-redesign.md")
+# 语料是**多份**了（设计文档 + bug 记录）。顺序固定 —— 索引里的块号 i 依赖它，
+# 顺序一变块号全变，对着旧块号记的笔记就废了。
+#
+# 两份都是 markdown，所以下面那套中文分隔符对两边都成立，不需要按扩展名分派切块器。
+CORPUSES = [
+    Path(r"C:\Users\33705\Desktop\项目\2026-07-04-yunxi-redesign.md"),
+    Path(r"D:\study\yunxi-server\docs\bug-record.md"),
+]
 MODEL_DIR = ROOT / "models" / "Qwen3-Embedding-0.6B"
 
 # 跟手写版一样的 500 / 0，好直接对比。
@@ -78,17 +85,23 @@ def get_embeddings():
     )
 
 
+def corpus_texts():
+    """产出 (文件名, 带标题的全文)。**索引和长上下文两条路都走这里** ——
+
+    两边拿到的字符串必须逐字节相同，否则对照实验比的就不是检索策略了。
+    """
+    for src in CORPUSES:
+        if not src.exists():
+            sys.exit(f"找不到语料：{src}")
+        yield src.name, f"# 文件：{src.name}\n\n" + src.read_text(encoding="utf-8")
+
+
 def build_index(embeddings, verbose=True):
     """读文档 → 切块 → 编码 → 存 FAISS。"""
     import torch  # noqa: F401  （确认 torch 在，报错更早更清楚）
     from langchain_community.vectorstores import FAISS
     from langchain_core.documents import Document
     from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-    if not CORPUS.exists():
-        sys.exit(f"找不到语料：{CORPUS}")
-
-    text = CORPUS.read_text(encoding="utf-8")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -98,15 +111,26 @@ def build_index(embeddings, verbose=True):
         # 让它在句子/分句的边界上找落脚点。
         separators=["\n\n", "\n", "。", "；", "，", " ", ""],
     )
-    docs = splitter.create_documents([text])
+
+    # 逐份切，块号 i **全局连续**（跨文件不重置）。理由是检索评测拿 i 当块的身份，
+    # 重置的话两份语料会出现两个「第 3 块」，对不上号。
+    docs, total_chars = [], 0
+    for name, text in corpus_texts():
+        total_chars += len(text)
+        part = splitter.create_documents([text])
+        for d in part:
+            d.metadata["source"] = name
+        docs.extend(part)
+
     for i, d in enumerate(docs):
-        d.metadata["source"] = CORPUS.name
         d.metadata["i"] = i
 
     if verbose:
-        print(f"切块  {len(text):,} 字符 → {len(docs)} 块"
+        print(f"切块  {total_chars:,} 字符（{len(CORPUSES)} 份）→ {len(docs)} 块"
               f"（chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}）")
-        print(f"      手写固定切块同样参数是 148 块 —— 差多少就是边界选择的差别")
+        for src in CORPUSES:
+            n = sum(1 for d in docs if d.metadata["source"] == src.name)
+            print(f"      {src.name}：{n} 块")
         print("编码中（第一次约 2 分钟）…")
 
     store = FAISS.from_documents(docs, embeddings)

@@ -45,62 +45,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-# ── 10 道题 ───────────────────────────────────────────────────────────────
-# 锚点必须是**句子级**的，不能是关键词。第一版我用了 'DECR' / '分叉点' 这种词，
-# 结果 'DECR' 落在 8 块里 —— 量出来的是词频不是答案位置，5 道"集中题"全被
-# 算成散落。锚点收到只在该答案处出现的整句后，落点才是真的。
-CASES = [
-    # ── 集中：一份答案就够 ──
-    dict(type="集中", mode="any",
-         q="订单状态码 1-7 分别叫什么？网单和门店单在哪个状态分叉？",
-         groups=[["| 4 | 待出厂 | 洗涤完成，等待下一步 |",
-                  "| 6 | 派送中 | 快递配送中 | 仅网单 |"]]),
+sys.path.insert(0, str(ROOT / "scripts"))
+from eval_cases import BUG_CASES, CASES  # noqa: E402  （题库和答案级评测共用一份，别分家）
 
-    dict(type="集中", mode="any",
-         q="精洗的价格是怎么定出来的？有没有例外？",
-         groups=[["精洗价不用手动填，后端根据", "精洗价直接手动填写"]]),
 
-    dict(type="集中", mode="any",
-         q="抢券为什么不用 MySQL 直接扣库存？",
-         groups=[["MySQL 行锁能解决超卖", "Redis 单线程 + 原子 DECR"],       # §11.3
-                 ["行锁能防超卖但要排队等锁", "Redis 单线程 + DECR 原子操作"]]),  # §11.8
+def all_cases() -> list[dict]:
+    """两份题库合起来，都打上「题库」标签。
 
-    dict(type="集中", mode="any",
-         q="快递单号有长度上限吗？多少？按什么口径数？",
-         groups=[["不超过 50 个字符（按 **code point** 数",
-                  "按 **code point** 数，不是 `length()`"]]),
+    **新题必须过 audit() 这一关** —— 不审就上，等于把锚点自己的错
+    （打错字、跨块被劈开）算到检索头上。bug 文档那 6 道是新加的，
+    锚点虽然已逐字验过存在，但"有没有被切块劈开"只有这里的 audit 能查。
 
-    dict(type="集中", mode="any",
-         q="订单表为什么不用外键？引用完整性靠什么保证？",
-         groups=[["逻辑关系」，不是外键约束", "引用完整性由代码负责"]]),
-
-    # ── 散落：每一片都要 ──
-    dict(type="散落", mode="all",
-         q="折扣券从发放到核销：谁能创建、谁能用、核销记录写在哪？",
-         groups=[["店长创建折扣券", "管理员 → 403「管理员不参与发券」"],   # §11.6 谁能建
-                 ["门店单和网单都能用**（2026-09-12"],                    # §5.8 谁能用
-                 ["UPDATE coupon_grabs SET used = 1, used_time = NOW()"]]),  # §5.8 核销
-
-    dict(type="散落", mode="all",
-         q="顾客有哪两种来源？系统怎么区分「设过密码」和「没设过密码」？",
-         groups=[["**NULL**（线上确实不知道他是谁）"],                     # §4.3 表
-                 ["注册即登录，**只要手机号+密码**"]]),                     # §11.6
-
-    dict(type="散落", mode="all",
-         q="一个 token 会因为哪些原因失效？",
-         groups=[["登出时 Token 加入 Redis 黑名单"],                      # §6.2 按票
-                 ["auth:staff:invalidAfter:<staffId> = 当前毫秒"]]),       # §6.2 按人
-
-    dict(type="散落", mode="all",
-         q="项目里 Redis 存了哪些东西？各自的键名是什么？",
-         groups=[["coupon:stock:{couponId}", "coupon:grabbed:{couponId}"],        # §11.5
-                 ["blacklist:token:", "auth:staff:invalidAfter:<staffId> = 当前毫秒"]]),  # §6.2
-
-    dict(type="散落", mode="all",
-         q="「管理员不参与业务」具体体现在哪几件事上？",
-         groups=[["不参与订单操作，也不能改价"],                            # §4.2
-                 ["管理员 → 403「管理员不参与发券」"]]),                     # §11.6
-]
+    汇总也**必须分题库报**：bug 文档对设计文档那 10 道题含零条标准答案、
+    却含大量同词（`403` 70 次、`token` 62 次）—— 合在一起报，
+    读到的差值里混着"候选池从 214 涨到 547"这个纯干扰效应。
+    """
+    for c in CASES:
+        c.setdefault("题库", "设计文档")
+    for c in BUG_CASES:
+        c.setdefault("题库", "bug文档")
+    return CASES + BUG_CASES
 
 
 def chunks_from_store(store) -> dict[int, str]:
@@ -128,8 +92,8 @@ def audit(corpus: str, chunks: dict[int, str]) -> list[tuple]:
     print("=" * 76)
     problems = []
 
-    for case in CASES:
-        print(f"\n[{case['type']}/{case['mode']}] {case['q']}")
+    for case in all_cases():
+        print(f"\n[{case['题库']}/{case['type']}/{case['mode']}] {case['q']}")
         spans = []
         for gi, group in enumerate(case["groups"], 1):
             per_anchor = []
@@ -172,7 +136,7 @@ def audit(corpus: str, chunks: dict[int, str]) -> list[tuple]:
 
 def evaluate(store, chunks: dict[int, str], k: int) -> list[dict]:
     out = []
-    for case in CASES:
+    for case in all_cases():
         got = {d.metadata["i"] for d, _s in store.similarity_search_with_score(case["q"], k=k)}
         got &= set(chunks)
 
@@ -211,20 +175,26 @@ def report(results: list[dict], k: int, chunks: dict, verbose: bool) -> None:
                 tag = "★答案区" if i in r["span"] else "  噪音"
                 print(f"      {tag}  第 {i:>3} 块  {chunks[i][:48]}".replace("\n", "⏎"))
 
-    # ---- 汇总 ----
+    # ---- 汇总：**分题库报，不给跨库合计** ----
+    #
+    # 为什么不合计：bug 文档那 332 块对设计文档的 10 道题含**零条标准答案**，
+    # 却是主题相近的干扰块（`403` 70 次、`token` 62 次）。候选池从 214 涨到 547
+    # 本身就是对检索的惩罚。合在一起给一个"总命中率"，读到的差值里
+    # 混着这个纯干扰效应 —— 而那跟"检索好不好"不是一回事。
     print("\n" + "=" * 76)
     print(f"汇总（k={k}）")
     print("=" * 76)
-    print(f"{'类型':<6}{'题数':>5}{'答得出':>8}{'命中率':>9}{'答案最少需块':>14}")
-    for t in ("集中", "散落"):
-        rs = [r for r in results if r["case"]["type"] == t]
-        n_ok = sum(1 for r in rs if r["ok"])
-        avg_need = sum(r["need"] for r in rs) / len(rs)
-        print(f"{t:<6}{len(rs):>5}{n_ok:>8}{n_ok / len(rs) * 100:>8.0f}%{avg_need:>13.1f}")
-    n_ok = sum(1 for r in results if r["ok"])
-    avg_need = sum(r["need"] for r in results) / len(results)
-    print(f"{'合计':<6}{len(results):>5}{n_ok:>8}{n_ok / len(results) * 100:>8.0f}%"
-          f"{avg_need:>13.1f}")
+    print(f"{'题库':<8}{'类型':<6}{'题数':>5}{'答得出':>8}{'命中率':>9}{'答案最少需块':>14}")
+    for 题库 in ("设计文档", "bug文档"):
+        for t in ("集中", "散落"):
+            rs = [r for r in results
+                  if r["case"]["题库"] == 题库 and r["case"]["type"] == t]
+            if not rs:
+                continue
+            n_ok = sum(1 for r in rs if r["ok"])
+            avg_need = sum(r["need"] for r in rs) / len(rs)
+            print(f"{题库:<8}{t:<6}{len(rs):>5}{n_ok:>8}"
+                  f"{n_ok / len(rs) * 100:>8.0f}%{avg_need:>13.1f}")
 
     print("\n  归因 —— 没答得出的题，卡在哪：")
     for r in results:
@@ -261,8 +231,10 @@ def main() -> None:
         print("查询端已加 instruction 前缀")
     store = rag.load_index(emb)
     chunks = chunks_from_store(store)
-    corpus = rag.CORPUS.read_text(encoding="utf-8")
-    print(f"语料 {rag.CORPUS.name}：{len(corpus):,} 字符 → 索引 {len(chunks)} 块"
+    parts = list(rag.corpus_texts())
+    corpus = "\n\n".join(t for _n, t in parts)
+    print(f"语料 {' + '.join(n for n, _t in parts)}：{len(corpus):,} 字符"
+          f" → 索引 {len(chunks)} 块"
           f"（chunk_size={rag.CHUNK_SIZE}, overlap={rag.CHUNK_OVERLAP}）")
 
     problems = audit(corpus, chunks)
